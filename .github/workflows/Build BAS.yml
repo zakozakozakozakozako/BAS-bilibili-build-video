@@ -1,0 +1,234 @@
+name: Video → SVG → BAS Danmaku
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_file:
+        description: "仓库根目录中的视频文件名（例如：input.mp4）"
+        required: true
+        default: "input.mp4"
+      fps:
+        description: "抽帧/时间换算的帧率（与 -fps 保持一致）"
+        required: true
+        default: "5"
+      palette_size:
+        description: "颜色量化的调色板大小（每帧最多保留多少种颜色）"
+        required: true
+        default: "16"
+      concurrency:
+        description: "PNG→SVG 并发数"
+        required: true
+        default: "4"
+      viewbox_w:
+        description: "BAS 画布宽（-w）"
+        required: true
+        default: "4000"
+      viewbox_h:
+        description: "BAS 画布高（-h）"
+        required: true
+        default: "3620"
+      max_chars:
+        description: "单个 BAS 文本最大字符数（-maxsize）"
+        required: true
+        default: "500000"
+      start_offset_ms:
+        description: "起始偏移毫秒（-starttime）"
+        required: true
+        default: "3000"
+      json_start_index:
+        description: "3-*.js 的起始 JSON 序号（-s）"
+        required: true
+        default: "1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      NODE_OPTIONS: "--max-old-space-size=8192"
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show inputs
+        run: |
+          echo "video_file=${{ inputs.video_file }}"
+          echo "fps=${{ inputs.fps }}"
+          echo "palette_size=${{ inputs.palette_size }}"
+          echo "concurrency=${{ inputs.concurrency }}"
+          echo "viewbox_w=${{ inputs.viewbox_w }}"
+          echo "viewbox_h=${{ inputs.viewbox_h }}"
+          echo "max_chars=${{ inputs.max_chars }}"
+          echo "start_offset_ms=${{ inputs.start_offset_ms }}"
+          echo "json_start_index=${{ inputs.json_start_index }}"
+
+      - name: Install system deps (ffmpeg, potrace, ImageMagick 7)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ffmpeg potrace build-essential \
+            libpng-dev libjpeg-dev libtiff-dev libwebp-dev libltdl-dev wget
+
+          wget https://imagemagick.org/archive/ImageMagick.tar.gz
+          tar xvzf ImageMagick.tar.gz
+          cd ImageMagick-7*
+
+          # 编译安装？
+          ./configure --with-modules --with-perl --with-png=yes --with-jpeg=yes
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig /usr/local/lib
+          export PATH=/usr/local/bin:$PATH
+
+          # 检查版本和 PNG 支持
+          magick -version
+          magick -list format | grep PNG
+          ffmpeg -version
+          potrace -v
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Locate tool folder (the one containing 2/3/4 scripts)
+        id: locate
+        run: |
+          set -euo pipefail
+          # 找到包含 4-json*.js 的目录，基本等于压缩包里的主目录（避免乱码路径写死）
+          TOOL_DIR="$(dirname "$(git ls-files | grep -E '/4-.*bas.*\.js$' | head -n1)")"
+          if [ -z "${TOOL_DIR}" ]; then
+            echo "❌ 未找到 4-json…bas…js 工具脚本" >&2
+            exit 1
+          fi
+          echo "tool_dir=${TOOL_DIR}" >> "$GITHUB_OUTPUT"
+          echo "Tool dir: ${TOOL_DIR}"
+
+      - name: Install Node deps for tools
+        run: |
+          set -euo pipefail
+          npm ci --prefix "${{ steps.locate.outputs.tool_dir }}"
+
+      - name: Prepare working dirs
+        run: |
+          mkdir -p work/frames work/split work/svgs svgjson
+
+      - name: Extract frames with ffmpeg
+        run: |
+          set -euo pipefail
+          ffmpeg -y -i "${{ inputs.video_file }}" -vf "fps=${{ inputs.fps }}" "work/frames/%06d.png"
+
+      - name: Color quantize & split per-frame into RRGGBB layers (ImageMagick)
+        run: |
+          set -euo pipefail
+          FPS="${{ inputs.fps }}"
+          PALETTE="${{ inputs.palette_size }}"
+
+          idx=0
+          for f in work/frames/*.png; do
+            [ -e "$f" ] || { echo "No frames found."; exit 1; }
+            idx=$((idx+1))
+            # 帧时间（毫秒）
+            # (idx-1)/FPS * 1000
+            ms=$(python3 -c "fps=float('${FPS}'); i=${idx}; print(int(((i-1)/fps)*1000))")
+            folder="work/split/${idx}_${ms}"
+            mkdir -p "$folder"
+
+            # 先量化到有限颜色，避免唯一色过多
+            qpng="${folder}/_quant.png"
+            magick "$f" -alpha off -dither FloydSteinberg -colors "$PALETTE" "$qpng"
+
+            # 列出按频次排序的颜色（#RRGGBB）
+            mapfile -t COLORS < <(magick "$qpng" -format "%c" histogram:info:- \
+              | sort -nr \
+              | awk -F'#' '{if (NF>1){split($2,a,/[^0-9A-Fa-f]/); if(length(a[1])==6) print toupper(a[1])}}')
+
+            # 针对每个颜色，生成二值遮罩 PNG（白色=该色，黑色=其它）
+            # 文件命名：RRGGBB.png —— 正好满足 3-*.js 的文件名规则（长度10含扩展名）
+            for hex in "${COLORS[@]}"; do
+              # 防止过多微小颜色，按 PALETTE 截断
+              [ -f "${folder}/${hex}.png" ] && continue
+              [ "$(ls "${folder}"/*.png 2>/dev/null | wc -l)" -ge "$PALETTE" ] && break
+              magick "$qpng" -alpha off -fill white -opaque "#${hex}" -fill black +opaque "#${hex}" "${folder}/${hex}.png"
+            done
+
+            rm -f "$qpng"
+          done
+
+      - name: PNG → SVG (potrace), recursive
+        run: |
+          set -euo pipefail
+          node "${{ steps.locate.outputs.tool_dir }}/2-"*svg.js \
+            -d "work/split" \
+            -c "${{ inputs.concurrency }}"
+        env:
+          NODE_NO_WARNINGS: '1'
+
+      - name: SVG → JSON (batched)
+        run: |
+          set -euo pipefail
+          node "${{ steps.locate.outputs.tool_dir }}/3-"*json.js \
+            -d "work/split" \
+            -s "${{ inputs.json_start_index }}"
+        env:
+          NODE_NO_WARNINGS: '1'
+
+      - name: JSON → BAS 弹幕（.txt）
+        run: |
+          set -euo pipefail
+          # 在仓库根目录执行（4-*.js 固定读取 ./svgjson）
+          node "${{ steps.locate.outputs.tool_dir }}/4-"*bas*.js \
+            -w "${{ inputs.viewbox_w }}" \
+            -h "${{ inputs.viewbox_h }}" \
+            -maxsize "${{ inputs.max_chars }}" \
+            -starttime "${{ inputs.start_offset_ms }}" \
+            -fps "${{ inputs.fps }}"
+        env:
+          NODE_NO_WARNINGS: '1'
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out/bas_txt out/frames_png out/color_split_png out/svgs out/svgjson
+          # bas txt
+          find . -maxdepth 1 -type f -name "*_[0-9]*.txt" -print0 | xargs -0 -I{} cp "{}" out/bas_txt/ || true
+          # frames
+          cp -r work/frames/* out/frames_png/ || true
+          # split
+          find work/split -type f -name "*.png" -print0 | xargs -0 -I{} bash -c 'd=$(dirname "{}"); base=$(basename "{}"); mkdir -p "out/color_split_png/${d#work/split/}"; cp "{}" "out/color_split_png/${d#work/split/}/${base}"' || true
+          # svgs（与分层目录平行）
+          find work/split -type f -name "*.svg" -print0 | xargs -0 -I{} bash -c 'd=$(dirname "{}"); base=$(basename "{}"); mkdir -p "out/svgs/${d#work/split/}"; cp "{}" "out/svgs/${d#work/split/}/${base}"' || true
+          # svgjson
+          cp -r svgjson/* out/svgjson/ || true
+
+      - name: Upload BAS txt
+        uses: actions/upload-artifact@v4
+        with:
+          name: bas_txt
+          path: out/bas_txt
+
+      - name: Upload frames (PNG)
+        uses: actions/upload-artifact@v4
+        with:
+          name: frames_png
+          path: out/frames_png
+
+      - name: Upload color-split PNG
+        uses: actions/upload-artifact@v4
+        with:
+          name: color_split_png
+          path: out/color_split_png
+
+      - name: Upload SVGs
+        uses: actions/upload-artifact@v4
+        with:
+          name: svgs
+          path: out/svgs
+
+      - name: Upload svgjson
+        uses: actions/upload-artifact@v4
+        with:
+          name: svgjson
+          path: out/svgjson
