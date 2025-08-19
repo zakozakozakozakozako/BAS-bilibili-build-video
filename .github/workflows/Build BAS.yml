@@ -116,7 +116,7 @@ jobs:
 
       - name: 5) 生成 JSON（Node）
         run: |
-          node 3-批量转换json.js > guanjia/output.json
+          node 3-批量转换json.js -d guanjia > guanjia/output.json
         env:
           W: ${{ env.W }}
           H: ${{ env.H }}
