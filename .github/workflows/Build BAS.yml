@@ -43,9 +43,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg potrace imagemagick
 
-      - name: Symlink convert to magick
+      - name: Create magick wrapper (for ImageMagick 6)
         run: |
-          sudo ln -s /usr/bin/convert /usr/local/bin/magick
+          echo '#!/bin/bash' | sudo tee /usr/local/bin/magick
+          echo 'exec convert "$@"' | sudo tee -a /usr/local/bin/magick
+          sudo chmod +x /usr/local/bin/magick
+          which magick
+          magick -version || true
 
       - name: Install Python deps
         run: |
