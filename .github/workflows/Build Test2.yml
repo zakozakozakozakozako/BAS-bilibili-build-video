@@ -1,4 +1,4 @@
-name: Video Frame Color Segmentation (2
+name: Video Frame Color Segmentation (enhanced)
 
 on:
   workflow_dispatch:
@@ -7,45 +7,87 @@ on:
         description: '视频文件名（仓库根目录，或用下方artifact名称下载）'
         required: true
         default: 'input.mp4'
-      fps:
-        description: '帧率'
-        required: true
-        default: '1'
       artifact_name:
         description: '（可选）若视频不在仓库，填写Artifact名称以下载'
         required: false
-      W:
-        description: "画布宽"
+        default: ''
+      fps:
+        description: '抽帧帧率'
         required: true
-        default: "4000"
-      H:
-        description: "画布高"
-        required: true
-        default: "3620"
+        default: '5'
 
 jobs:
-  build:
+  process-video:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ github.workspace }}
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.10"
-
       - name: Setup Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: '22'
 
-      - name: Install dependencies
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system deps (ffmpeg, potrace, imagemagick6)
         run: |
-          pip install pillow
           sudo apt-get update
-          sudo apt-get install -y potrace
-          npm install commander cli-progress ora
+          sudo apt-get install -y ffmpeg potrace imagemagick
+
+      # 修正 magick wrapper，兼容 IM6
+      - name: Fix magick wrapper
+        run: |
+          echo '#!/bin/bash' | sudo tee /usr/local/bin/magick
+          echo 'if [ "$1" = "convert" ]; then shift; fi' | sudo tee -a /usr/local/bin/magick
+          echo 'exec convert "$@"' | sudo tee -a /usr/local/bin/magick
+          sudo chmod +x /usr/local/bin/magick
+          magick -version
+
+      - name: Install Python deps
+        run: |
+          python -m pip install pillow numpy
+
+      - name: Install Node deps
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm i; fi
+
+      - name: (Optional) Download video artifact
+        if: ${{ inputs.artifact_name != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: .
+
+      - name: Ensure working folders
+        run: |
+          mkdir -p frames
+          mkdir -p guanjia/converted_svgs
+          mkdir -p segmented
+          echo "Folders prepared."
+
+      - name: Verify input video exists
+        run: |
+          test -f "${{ inputs.video_file }}" || { echo "❌ Video file ${{ inputs.video_file }} not found"; ls -la; exit 1; }
+          echo "Found video: ${{ inputs.video_file }}"
+
+      - name: Probe resolution and set env
+        id: probe
+        run: |
+          read W H < <(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "${{ inputs.video_file }}" | tr 'x' ' ')
+          echo "W=$W" | tee -a $GITHUB_ENV
+          echo "H=$H" | tee -a $GITHUB_ENV
+          echo "W10=$(( W / 10 ))" | tee -a $GITHUB_ENV
+          echo "H10=$(( H / 10 ))" | tee -a $GITHUB_ENV
+          echo "Resolution ${W}x${H} (10% => ${W10}x${H10})"
 
       - name: 1) Extract frames with ffmpeg
         run: |
@@ -56,54 +98,61 @@ jobs:
         run: |
           python convert_frames_to_svg.py
 
-      - name: 2.5) Rename SVGs by color
+      - name: 2.5) Rename SVGs by fill color
         run: |
-          mkdir -p guanjia/converted_svgs_renamed
           for f in guanjia/converted_svgs/*.svg; do
-            # 提取 fill 颜色，取第一个匹配
             color=$(grep -o 'fill="#[0-9A-Fa-f]\{6\}"' "$f" | head -n1 | cut -d'"' -f2 | sed 's/#//')
             if [ -z "$color" ]; then
               color="000000" # 默认黑色
             fi
-            newname="${color}.svg"
-            cp "$f" "guanjia/converted_svgs_renamed/$newname"
-            echo "Renamed $(basename "$f") -> $newname"
+            newname="guanjia/converted_svgs/${color}.svg"
+            mv "$f" "$newname"
+            echo "Renamed $(basename "$f") -> $(basename "$newname")"
           done
-          echo "重命名完成，全部放到 guanjia/converted_svgs_renamed"
+          echo "SVG 文件已按颜色重命名"
 
       - name: 3) 批量转换 SVG（Node）
         run: |
-          node 2-批量转换svg.js -d guanjia/converted_svgs_renamed
+          node 2-批量转换svg.js -d guanjia/converted_svgs
         env:
-          OUT_DIR: ${{ github.workspace }}/guanjia/converted_svgs_final
+          OUT_DIR: ${{ github.workspace }}/guanjia/converted_svgs
 
       - name: 4) Compat symlinks for legacy script
         run: |
+          # 兼容 video_frames 路径
           rm -rf video_frames
           mkdir -p video_frames
           ln -s ../frames video_frames
-          ln -s ../guanjia/converted_svgs_renamed video_frames/converted_svgs
+          ln -s ../guanjia/converted_svgs video_frames/converted_svgs
           echo "Compat symlinks created:"
           ls -la video_frames
 
       - name: 5) 生成 JSON（Node）
         run: |
-          node 3-批量转换json.js -d guanjia/converted_svgs_renamed > guanjia/output.json
+          node 3-批量转换json.js -d guanjia > guanjia/output.json
         env:
-          W: ${{ inputs.W }}
-          H: ${{ inputs.H }}
+          W: ${{ env.W }}
+          H: ${{ env.H }}
 
       - name: 6) JSON -> bas 弹幕（Node）
         run: |
           node 4-json数据转换bas弹幕.js -w $W10 -h $H10 > guanjia/bas.txt
         env:
-          W: ${{ inputs.W }}
-          H: ${{ inputs.H }}
-          W10: ${{ inputs.W }}0
-          H10: ${{ inputs.H }}0
+          W: ${{ env.W }}
+          H: ${{ env.H }}
+          W10: ${{ env.W10 }}
+          H10: ${{ env.H10 }}
 
-      - name: Upload results
+      - name: 7) Archive outputs
+        run: |
+          zip -r guanjia_artifacts.zip guanjia || true
+
+      - name: Upload result artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: results
-          path: guanjia/
+          name: segmented_output
+          if-no-files-found: warn
+          path: |
+            guanjia_artifacts.zip
+            guanjia/output.json
+            guanjia/bas.txt
