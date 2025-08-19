@@ -94,10 +94,6 @@ jobs:
           rm -rf frames/*
           ffmpeg -y -i "${{ inputs.video_file }}" -vf "fps=${{ inputs.fps }}" frames/frame_%06d.png
 
-      - name: 2) Convert frames -> SVG (Python)
-        run: |
-          python convert_frames_to_svg.py
-
       - name: 3) 批量转换 SVG（Node）
         run: |
           node 2-批量转换svg.js -d ./frames
