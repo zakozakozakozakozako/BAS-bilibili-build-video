@@ -1,80 +1,109 @@
-name: Video → BAS Full Pipeline
+name: Video Frame Color Segmentation (2
 
 on:
   workflow_dispatch:
     inputs:
       video_file:
-        description: '视频文件名（仓库根目录，或 artifact 下载）'
+        description: '视频文件名（仓库根目录，或用下方artifact名称下载）'
         required: true
         default: 'input.mp4'
-      artifact_name:
-        description: '（可选）artifact 名称（如果视频不在仓库中）'
-        required: false
-        default: ''
       fps:
-        description: '抽帧帧率'
+        description: '帧率'
         required: true
-        default: '5'
+        default: '1'
+      artifact_name:
+        description: '（可选）若视频不在仓库，填写Artifact名称以下载'
+        required: false
+      W:
+        description: "画布宽"
+        required: true
+        default: "4000"
+      H:
+        description: "画布高"
+        required: true
+        default: "3620"
 
 jobs:
-  build-bas:
+  build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-        working-directory: ${{ github.workspace }}
-
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
+        uses: actions/checkout@v3
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: "3.10"
 
-      - name: Install system deps (ffmpeg, potrace, imagemagick6)
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "18"
+
+      - name: Install dependencies
         run: |
+          pip install pillow
           sudo apt-get update
-          sudo apt-get install -y ffmpeg potrace imagemagick
+          sudo apt-get install -y potrace
+          npm install commander cli-progress ora
 
-      - name: Install Node.js deps
-        run: npm install
-
-      - name: Prepare folders
+      - name: 1) Extract frames with ffmpeg
         run: |
-          mkdir -p frames guanjia/converted_svgs svgjson output
+          rm -rf frames/*
+          ffmpeg -y -i "${{ inputs.video_file }}" -vf "fps=${{ inputs.fps }}" frames/frame_%06d.png
 
-      - name: Download video artifact (if provided)
-        if: ${{ github.event.inputs.artifact_name != '' }}
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ github.event.inputs.artifact_name }}
-          path: .
-
-      - name: Extract frames with ffmpeg
+      - name: 2) Convert frames -> SVG (Python)
         run: |
-          ffmpeg -i "${{ github.event.inputs.video_file }}" -vf fps=${{ github.event.inputs.fps }} frames/frame_%04d.png
+          python convert_frames_to_svg.py
 
-      - name: Convert frames to SVG (Python)
-        run: python convert_frames_to_svg.py
+      - name: 2.5) Rename SVGs by color
+        run: |
+          mkdir -p guanjia/converted_svgs_renamed
+          for f in guanjia/converted_svgs/*.svg; do
+            # 提取 fill 颜色，取第一个匹配
+            color=$(grep -o 'fill="#[0-9A-Fa-f]\{6\}"' "$f" | head -n1 | cut -d'"' -f2 | sed 's/#//')
+            if [ -z "$color" ]; then
+              color="000000" # 默认黑色
+            fi
+            newname="${color}.svg"
+            cp "$f" "guanjia/converted_svgs_renamed/$newname"
+            echo "Renamed $(basename "$f") -> $newname"
+          done
+          echo "重命名完成，全部放到 guanjia/converted_svgs_renamed"
 
-      - name: 批量转换 SVG (JS #2)
-        run: node "2-批量转换svg.js" -d ./frames -c 4
+      - name: 3) 批量转换 SVG（Node）
+        run: |
+          node 2-批量转换svg.js -d guanjia/converted_svgs_renamed
+        env:
+          OUT_DIR: ${{ github.workspace }}/guanjia/converted_svgs_final
 
-      - name: 转换 JSON (JS #3)
-        run: node "3-批量转换json.js" 0 ./guanjia/converted_svgs
+      - name: 4) Compat symlinks for legacy script
+        run: |
+          rm -rf video_frames
+          mkdir -p video_frames
+          ln -s ../frames video_frames
+          ln -s ../guanjia/converted_svgs_renamed video_frames/converted_svgs
+          echo "Compat symlinks created:"
+          ls -la video_frames
 
-      - name: 转换 BAS 弹幕 (JS #4)
-        run: node "4-json数据转换bas弹幕.js" -w 4000 -h 3620 -fps ${{ github.event.inputs.fps }} > output/result.bas
+      - name: 5) 生成 JSON（Node）
+        run: |
+          node 3-批量转换json.js -d guanjia/converted_svgs_renamed > guanjia/output.json
+        env:
+          W: ${{ inputs.W }}
+          H: ${{ inputs.H }}
+
+      - name: 6) JSON -> bas 弹幕（Node）
+        run: |
+          node 4-json数据转换bas弹幕.js -w $W10 -h $H10 > guanjia/bas.txt
+        env:
+          W: ${{ inputs.W }}
+          H: ${{ inputs.H }}
+          W10: ${{ inputs.W }}0
+          H10: ${{ inputs.H }}0
 
       - name: Upload results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
-          name: bas_output
-          path: output/
+          name: results
+          path: guanjia/
