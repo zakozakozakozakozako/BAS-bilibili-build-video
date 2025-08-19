@@ -46,7 +46,7 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pillow numpy potrace
+          python -m pip install pillow numpy
 
       - name: Install Node deps
         run: |
