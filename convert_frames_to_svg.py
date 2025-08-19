@@ -1,57 +1,34 @@
-#!/usr/bin/env python3
-import os
-import zipfile
+# --- injected guard (safe in Python) ---
+import os, pathlib, subprocess
 from PIL import Image
-import numpy as np
-import potrace
 
-def curve_to_svg(curve):
-    """
-    将 potrace.Curve 转为 SVG path d 字符串
-    """
-    d = []
-    start = curve.start_point
-    d.append(f'M {start[0]} {start[1]}')
-    for segment in curve:
-        if segment.is_corner:
-            c = segment.c
-            d.append(f'L {c[0]} {c[1]}')
-        else:  # bezier segment
-            c1, c2, end = segment.c1, segment.c2, segment.end_point
-            d.append(f'C {c1[0]} {c1[1]} {c2[0]} {c2[1]} {end[0]} {end[1]}')
-    return ' '.join(d)
+WORK = os.getcwd()
+out_dir = os.path.join(WORK, "guanjia", "converted_svgs")
+os.makedirs(out_dir, exist_ok=True)
+frames_dir = os.path.join(WORK, "frames")
+# --- end injected guard ---
 
-os.makedirs("segmented", exist_ok=True)
+def convert_to_svg(frame_path, svg_path):
+    # 临时 pbm 文件
+    pbm_path = frame_path.replace(".png", ".pbm")
+    # 转成黑白 pbm
+    img = Image.open(frame_path).convert("1")
+    img.save(pbm_path, "PPM")  # Pillow 会存成 PBM/PPM
 
-frames_dir = "frames"
-frames = sorted([f for f in os.listdir(frames_dir) if f.lower().endswith(".png")])
+    # 调用 potrace
+    subprocess.run(["potrace", "-s", pbm_path, "-o", svg_path], check=True)
 
-threshold = 128
+    # 可选：转完删除 pbm
+    os.remove(pbm_path)
 
-for fname in frames:
-    src = os.path.join(frames_dir, fname)
-    img = Image.open(src).convert("L")
-    arr = np.array(img)
-    bitmap = (arr > threshold).astype(np.uint8)
-    bmp = potrace.Bitmap(bitmap)
-    path_obj = bmp.trace()
-    svg_path = os.path.join("segmented", os.path.splitext(fname)[0]+".svg")
-    h, w = arr.shape
+def main():
+    for fname in sorted(os.listdir(frames_dir)):
+        if fname.lower().endswith(".png"):
+            frame_path = os.path.join(frames_dir, fname)
+            svg_name = os.path.splitext(fname)[0] + ".svg"
+            svg_path = os.path.join(out_dir, svg_name)
+            print(f"Converting {frame_path} -> {svg_path}")
+            convert_to_svg(frame_path, svg_path)
 
-    with open(svg_path, "w", encoding="utf-8") as f:
-        f.write(f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">\n')
-        for curve in path_obj:
-            d_str = curve_to_svg(curve)
-            f.write(f'  <path d="{d_str}" fill="black" stroke="none"/>\n')
-        f.write('</svg>\n')
-
-# 打包 segmented 文件夹
-zip_name = "guanjia.zip"
-with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as z:
-    for root, _, files in os.walk("segmented"):
-        for f_name in sorted(files):
-            full = os.path.join(root, f_name)
-            arcname = os.path.relpath(full, start="segmented")
-            z.write(full, arcname=arcname)
-
-print("Created", zip_name)
+if __name__ == "__main__":
+    main()
