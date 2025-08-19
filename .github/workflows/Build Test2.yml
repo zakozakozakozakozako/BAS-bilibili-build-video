@@ -1,0 +1,80 @@
+name: Video → BAS Full Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_file:
+        description: '视频文件名（仓库根目录，或 artifact 下载）'
+        required: true
+        default: 'input.mp4'
+      artifact_name:
+        description: '（可选）artifact 名称（如果视频不在仓库中）'
+        required: false
+        default: ''
+      fps:
+        description: '抽帧帧率'
+        required: true
+        default: '5'
+
+jobs:
+  build-bas:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system deps (ffmpeg, potrace, imagemagick6)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg potrace imagemagick
+
+      - name: Install Node.js deps
+        run: npm install
+
+      - name: Prepare folders
+        run: |
+          mkdir -p frames guanjia/converted_svgs svgjson output
+
+      - name: Download video artifact (if provided)
+        if: ${{ github.event.inputs.artifact_name != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.event.inputs.artifact_name }}
+          path: .
+
+      - name: Extract frames with ffmpeg
+        run: |
+          ffmpeg -i "${{ github.event.inputs.video_file }}" -vf fps=${{ github.event.inputs.fps }} frames/frame_%04d.png
+
+      - name: Convert frames to SVG (Python)
+        run: python convert_frames_to_svg.py
+
+      - name: 批量转换 SVG (JS #2)
+        run: node "2-批量转换svg.js" -d ./frames -c 4
+
+      - name: 转换 JSON (JS #3)
+        run: node "3-批量转换json.js" 0 ./guanjia/converted_svgs
+
+      - name: 转换 BAS 弹幕 (JS #4)
+        run: node "4-json数据转换bas弹幕.js" -w 4000 -h 3620 -fps ${{ github.event.inputs.fps }} > output/result.bas
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bas_output
+          path: output/
