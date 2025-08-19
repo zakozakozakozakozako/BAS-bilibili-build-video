@@ -104,14 +104,20 @@ jobs:
         env:
           OUT_DIR: ${{ github.workspace }}/guanjia/converted_svgs
 
-      - name: 4) 生成 JSON（Node）
+      - name: 4) Compat symlink for video_frames
+        run: |
+          ln -s ./frames ./video_frames || true
+          ln -s ./guanjia/converted_svgs ./video_frames/converted_svgs || true
+          ls -la ./video_frames
+
+      - name: 5) 生成 JSON（Node）
         run: |
           node 3-批量转换json.js > guanjia/output.json
         env:
           W: ${{ env.W }}
           H: ${{ env.H }}
 
-      - name: 5) JSON -> bas 弹幕（Node）
+      - name: 6) JSON -> bas 弹幕（Node）
         run: |
           node 4-json数据转换bas弹幕.js -w $W10 -h $H10 > guanjia/bas.txt
         env:
@@ -120,7 +126,7 @@ jobs:
           W10: ${{ env.W10 }}
           H10: ${{ env.H10 }}
 
-      - name: 6) Archive outputs
+      - name: 7) Archive outputs
         run: |
           zip -r guanjia_artifacts.zip guanjia || true
           zip -r segmented.zip segmented || true
