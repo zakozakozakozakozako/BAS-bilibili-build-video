@@ -1,4 +1,4 @@
-name: Video Frame Color Segmentation (enhanced)
+name: Video Frame Color Segmentation (enhanced)2
 
 on:
   workflow_dispatch:
