@@ -38,18 +38,19 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install system deps (ffmpeg, potrace, imagemagick)
+      - name: Install system deps (ffmpeg, potrace, imagemagick6)
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg potrace imagemagick
 
-      - name: Create magick wrapper (for ImageMagick 6)
+      # 修正 magick wrapper，兼容 IM6
+      - name: Fix magick wrapper
         run: |
           echo '#!/bin/bash' | sudo tee /usr/local/bin/magick
+          echo 'if [ "$1" = "convert" ]; then shift; fi' | sudo tee -a /usr/local/bin/magick
           echo 'exec convert "$@"' | sudo tee -a /usr/local/bin/magick
           sudo chmod +x /usr/local/bin/magick
-          which magick
-          magick -version || true
+          magick -version
 
       - name: Install Python deps
         run: |
