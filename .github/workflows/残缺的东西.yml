@@ -1,0 +1,189 @@
+name: Video → SVG → BAS Danmaku
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_file:
+        description: "仓库根目录中的视频文件名（例如：input.mp4）"
+        required: true
+        default: "input.mp4"
+      fps:
+        description: "抽帧/时间换算的帧率（与 -fps 保持一致）"
+        required: true
+        default: "5"
+      concurrency:
+        description: "PNG→SVG 并发数"
+        required: true
+        default: "4"
+      viewbox_w:
+        description: "BAS 画布宽（-w）"
+        required: true
+        default: "4000"
+      viewbox_h:
+        description: "BAS 画布高（-h）"
+        required: true
+        default: "3620"
+      start_offset_ms:
+        description: "起始偏移毫秒（-starttime）"
+        required: true
+        default: "3000"
+      json_start_index:
+        description: "3-*.js 的起始 JSON 序号（-s）"
+        required: true
+        default: "1"
+
+jobs:
+  process-video:
+    runs-on: ubuntu-latest
+    env:
+      NODE_OPTIONS: "--max-old-space-size=8192"
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show inputs
+        run: |
+          echo "video_file=${{ inputs.video_file }}"
+          echo "fps=${{ inputs.fps }}"
+          echo "concurrency=${{ inputs.concurrency }}"
+          echo "viewbox_w=${{ inputs.viewbox_w }}"
+          echo "viewbox_h=${{ inputs.viewbox_h }}"
+          echo "start_offset_ms=${{ inputs.start_offset_ms }}"
+          echo "json_start_index=${{ inputs.json_start_index }}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system deps (ffmpeg, potrace, imagemagick6)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg potrace imagemagick
+
+      - name: Fix magick wrapper (for IM6)
+        run: |
+          echo '#!/bin/bash' | sudo tee /usr/local/bin/magick
+          echo 'if [ "$1" = "convert" ]; then shift; fi' | sudo tee -a /usr/local/bin/magick
+          echo 'exec convert "$@"' | sudo tee -a /usr/local/bin/magick
+          sudo chmod +x /usr/local/bin/magick
+          magick -version
+          convert -version
+
+      - name: Install Python deps
+        run: |
+          python -m pip install pillow numpy
+
+      - name: Locate tool folder (the one containing 2/3/4 scripts)
+        id: locate
+        run: |
+          set -euo pipefail
+          TOOL_DIR="$(dirname "$(git ls-files | grep -E '/4-.*bas.*\.js$' | head -n1)")"
+          if [ -z "${TOOL_DIR}" ]; then
+            echo "❌ 未找到 4-json…bas…js 工具脚本" >&2
+            exit 1
+          fi
+          echo "tool_dir=${TOOL_DIR}" >> "$GITHUB_OUTPUT"
+          echo "Tool dir: ${TOOL_DIR}"
+
+      - name: Install Node deps for tools
+        run: |
+          set -euo pipefail
+          npm ci --prefix "${{ steps.locate.outputs.tool_dir }}"
+
+      - name: Ensure working dirs
+        run: |
+          mkdir -p work/frames work/split work/svgs svgjson
+          mkdir -p guanjia/converted_svgs segmented
+
+      - name: Verify input video exists
+        run: |
+          test -f "${{ inputs.video_file }}" || { echo "❌ Video file ${{ inputs.video_file }} not found"; ls -la; exit 1; }
+          echo "Found video: ${{ inputs.video_file }}"
+
+      - name: Probe resolution and set env
+        id: probe
+        run: |
+          read W H < <(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "${{ inputs.video_file }}" | tr 'x' ' ')
+          echo "W=$W" | tee -a $GITHUB_ENV
+          echo "H=$H" | tee -a $GITHUB_ENV
+          echo "W10=$(( W / 10 ))" | tee -a $GITHUB_ENV
+          echo "H10=$(( H / 10 ))" | tee -a $GITHUB_ENV
+          echo "Resolution ${W}x${H} (10% => ${W10}x${H10})"
+
+      - name: Extract frames with ffmpeg
+        run: |
+          set -euo pipefail
+          ffmpeg -y -i "${{ inputs.video_file }}" -vf "fps=${{ inputs.fps }}" "work/frames/%06d.png"
+
+
+      - name: PNG → SVG (potrace), recursive
+        run: |
+          set -euo pipefail
+          node "${{ steps.locate.outputs.tool_dir }}/2-"*svg.js \
+            -d "work/split" \
+            -c "${{ inputs.concurrency }}"
+        env:
+          NODE_NO_WARNINGS: '1'
+
+      - name: SVG → JSON (batched)
+        run: |
+          set -euo pipefail
+          node "${{ steps.locate.outputs.tool_dir }}/3-"*json.js \
+            -d "work/split" \
+            -s "${{ inputs.json_start_index }}"
+        env:
+          NODE_NO_WARNINGS: '1'
+
+      - name: JSON → BAS 弹幕（.txt）
+        run: |
+          set -euo pipefail
+          node "${{ steps.locate.outputs.tool_dir }}/4-"*bas*.js \
+            -w "${{ inputs.viewbox_w }}" \
+            -h "${{ inputs.viewbox_h }}" \
+            -starttime "${{ inputs.start_offset_ms }}" \
+            -fps "${{ inputs.fps }}"
+        env:
+          NODE_NO_WARNINGS: '1'
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out/bas_txt out/frames_png out/color_split_png out/svgs out/svgjson
+          find . -maxdepth 1 -type f -name "*_[0-9]*.txt" -print0 | xargs -0 -I{} cp "{}" out/bas_txt/ || true
+          cp -r work/frames/* out/frames_png/ || true
+          find work/split -type f -name "*.png" -print0 | xargs -0 -I{} bash -c 'd=$(dirname "{}"); base=$(basename "{}"); mkdir -p "out/color_split_png/${d#work/split/}"; cp "{}" "out/color_split_png/${d#work/split/}/${base}"' || true
+          find work/split -type f -name "*.svg" -print0 | xargs -0 -I{} bash -c 'd=$(dirname "{}"); base=$(basename "{}"); mkdir -p "out/svgs/${d#work/split/}"; cp "{}" "out/svgs/${d#work/split/}/${base}"' || true
+          cp -r svgjson/* out/svgjson/ || true
+
+      - name: Upload BAS txt
+        uses: actions/upload-artifact@v4
+        with:
+          name: bas_txt
+          path: out/bas_txt
+
+      - name: Upload frames (PNG)
+        uses: actions/upload-artifact@v4
+        with:
+          name: frames_png
+          path: out/frames_png
+
+      - name: Upload SVGs
+        uses: actions/upload-artifact@v4
+        with:
+          name: svgs
+          path: out/svgs
+
+      - name: Upload svgjson
+        uses: actions/upload-artifact@v4
+        with:
+          name: svgjson
+          path: out/svgjson
