@@ -104,11 +104,15 @@ jobs:
         env:
           OUT_DIR: ${{ github.workspace }}/guanjia/converted_svgs
 
-      - name: 4) Compat symlink for video_frames
+      - name: 4) Compat symlinks for legacy script
         run: |
-          ln -s ./frames ./video_frames || true
-          ln -s ./guanjia/converted_svgs ./video_frames/converted_svgs || true
-          ls -la ./video_frames
+          # 兼容 video_frames 路径
+          rm -rf video_frames
+          mkdir -p video_frames
+          ln -s ../frames video_frames
+          ln -s ../guanjia/converted_svgs video_frames/converted_svgs
+          echo "Compat symlinks created:"
+          ls -la video_frames
 
       - name: 5) 生成 JSON（Node）
         run: |
